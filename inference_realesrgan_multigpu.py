@@ -50,9 +50,8 @@ def process_image(path, args, upsampler, face_enhancer=None, progress_bar=None):
     return save_path
 
 
-def process_on_gpu(paths, args, gpu_id, progress_bar):
-    """Обрабатывает список изображений на указанном GPU."""
-    # Устанавливаем устройство (GPU)
+def process_on_gpu(paths, args, gpu_id, num_threads):
+    """Обрабатывает список изображений на указанном GPU с использованием потоков."""
     torch.cuda.set_device(gpu_id)
 
     # Инициализация модели для текущего GPU
@@ -120,13 +119,39 @@ def process_on_gpu(paths, args, gpu_id, progress_bar):
             channel_multiplier=2,
             bg_upsampler=upsampler)
 
-    # Обработка изображений на текущем GPU
+    # Разделение задач на потоки
+    paths_per_thread = [paths[i::num_threads] for i in range(num_threads)]
+
+    # Создание прогресс-баров для каждого потока
+    progress_bars = [
+        tqdm(total=len(paths_per_thread[i]), desc=f"GPU {gpu_id} Thread {i}", unit="image", position=gpu_id * num_threads + i)
+        for i in range(num_threads)
+    ]
+
+    # Запуск обработки в потоках
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = []
+        for thread_id, thread_paths in enumerate(paths_per_thread):
+            futures.append(executor.submit(
+                process_images_in_thread, thread_paths, args, upsampler, face_enhancer, progress_bars[thread_id]
+            ))
+
+        for future in as_completed(futures):
+            future.result()
+
+    # Закрытие прогресс-баров
+    for pbar in progress_bars:
+        pbar.close()
+
+
+def process_images_in_thread(paths, args, upsampler, face_enhancer, progress_bar):
+    """Обрабатывает изображения в потоке."""
     for path in paths:
         process_image(path, args, upsampler, face_enhancer, progress_bar)
 
 
 def main():
-    """Inference demo for Real-ESRGAN with multi-GPU support and progress bars."""
+    """Inference demo for Real-ESRGAN with multi-GPU and multi-thread support."""
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--input', type=str, default='inputs', help='Input image or folder')
     parser.add_argument(
@@ -167,7 +192,7 @@ def main():
     parser.add_argument(
         '-g', '--gpu-id', type=int, default=None, help='gpu device to use (default=None) can be 0,1,2 for multi-gpu')
     parser.add_argument(
-        '--num_threads', type=int, default=4, help='Number of threads for parallel processing')
+        '--num_threads', type=int, default=4, help='Number of threads per GPU for parallel processing')
 
     args = parser.parse_args()
 
@@ -188,21 +213,14 @@ def main():
     # Разделение задач между GPU
     paths_per_gpu = [paths[i::num_gpus] for i in range(num_gpus)]
 
-    # Создание прогресс-баров для каждого GPU
-    progress_bars = [tqdm(total=len(paths_per_gpu[i]), desc=f"GPU {i}", unit="image", position=i) for i in range(num_gpus)]
-
-    # Запуск обработки на каждом GPU
+    # Запуск обработки на каждом GPU с использованием потоков
     with ThreadPoolExecutor(max_workers=num_gpus) as executor:
         futures = []
         for gpu_id, paths in enumerate(paths_per_gpu):
-            futures.append(executor.submit(process_on_gpu, paths, args, gpu_id, progress_bars[gpu_id]))
+            futures.append(executor.submit(process_on_gpu, paths, args, gpu_id, args.num_threads))
 
         for future in as_completed(futures):
-            future.result()  # Ожидание завершения всех задач
-
-    # Закрытие всех прогресс-баров
-    for pbar in progress_bars:
-        pbar.close()
+            future.result()
 
 if __name__ == '__main__':
     main()
