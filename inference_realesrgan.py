@@ -4,14 +4,53 @@ import glob
 import os
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
-
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+from colorama import Fore, Style, init
+
+# Инициализация colorama для цветного вывода
+init(autoreset=True)
+
+
+def process_image(path, args, upsampler, face_enhancer=None, progress_bar=None):
+    """Обрабатывает одно изображение и сохраняет результат."""
+    imgname, extension = os.path.splitext(os.path.basename(path))
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if len(img.shape) == 3 and img.shape[2] == 4:
+        img_mode = 'RGBA'
+    else:
+        img_mode = None
+
+    try:
+        if args.face_enhance:
+            _, _, output = face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
+        else:
+            output, _ = upsampler.enhance(img, outscale=args.outscale)
+    except RuntimeError as error:
+        if progress_bar:
+            progress_bar.update(1)
+        return None, imgname
+
+    if args.ext == 'auto':
+        extension = extension[1:]
+    else:
+        extension = args.ext
+    if img_mode == 'RGBA':  # RGBA images should be saved in png format
+        extension = 'png'
+    if args.suffix == '':
+        save_path = os.path.join(args.output, f'{imgname}.{extension}')
+    else:
+        save_path = os.path.join(args.output, f'{imgname}_{args.suffix}.{extension}')
+    cv2.imwrite(save_path, output)
+    if progress_bar:
+        progress_bar.update(1)
+    return save_path, imgname
 
 
 def main():
-    """Inference demo for Real-ESRGAN.
-    """
+    """Inference demo for Real-ESRGAN with multithreading and multiple progress bars."""
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--input', type=str, default='inputs', help='Input image or folder')
     parser.add_argument(
@@ -51,10 +90,12 @@ def main():
         help='Image extension. Options: auto | jpg | png, auto means using the same extension as inputs')
     parser.add_argument(
         '-g', '--gpu-id', type=int, default=None, help='gpu device to use (default=None) can be 0,1,2 for multi-gpu')
+    parser.add_argument(
+        '--num_threads', type=int, default=4, help='Number of threads for parallel processing')
 
     args = parser.parse_args()
 
-    # determine models according to model names
+    # Определение модели и загрузка
     args.model_name = args.model_name.split('.')[0]
     if args.model_name == 'RealESRGAN_x4plus':  # x4 RRDBNet model
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
@@ -84,7 +125,7 @@ def main():
             'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth'
         ]
 
-    # determine model paths
+    # Загрузка модели
     if args.model_path is not None:
         model_path = args.model_path
     else:
@@ -92,18 +133,17 @@ def main():
         if not os.path.isfile(model_path):
             ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
             for url in file_url:
-                # model_path will be updated
                 model_path = load_file_from_url(
                     url=url, model_dir=os.path.join(ROOT_DIR, 'weights'), progress=True, file_name=None)
 
-    # use dni to control the denoise strength
+    # Использование DNI для управления уровнем шума
     dni_weight = None
     if args.model_name == 'realesr-general-x4v3' and args.denoise_strength != 1:
         wdn_model_path = model_path.replace('realesr-general-x4v3', 'realesr-general-wdn-x4v3')
         model_path = [model_path, wdn_model_path]
         dni_weight = [args.denoise_strength, 1 - args.denoise_strength]
 
-    # restorer
+    # Инициализация RealESRGANer
     upsampler = RealESRGANer(
         scale=netscale,
         model_path=model_path,
@@ -115,7 +155,9 @@ def main():
         half=not args.fp32,
         gpu_id=args.gpu_id)
 
-    if args.face_enhance:  # Use GFPGAN for face enhancement
+    # Инициализация GFPGAN (если нужно)
+    face_enhancer = None
+    if args.face_enhance:
         from gfpgan import GFPGANer
         face_enhancer = GFPGANer(
             model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
@@ -123,44 +165,34 @@ def main():
             arch='clean',
             channel_multiplier=2,
             bg_upsampler=upsampler)
+
+    # Создание выходной папки
     os.makedirs(args.output, exist_ok=True)
 
+    # Получение списка изображений
     if os.path.isfile(args.input):
         paths = [args.input]
     else:
         paths = sorted(glob.glob(os.path.join(args.input, '*')))
 
-    for idx, path in enumerate(paths):
-        imgname, extension = os.path.splitext(os.path.basename(path))
-        print('Testing', idx, imgname)
+    # Многопоточная обработка с несколькими прогресс-барами
+    with ThreadPoolExecutor(max_workers=args.num_threads) as executor:
+        # Создаем прогресс-бары для каждого потока
+        progress_bars = [tqdm(total=len(paths) // args.num_threads, desc=f"Thread {i}", unit="image", position=i) for i in range(args.num_threads)]
+        futures = {}
+        for idx, path in enumerate(paths):
+            thread_id = idx % args.num_threads
+            futures[executor.submit(process_image, path, args, upsampler, face_enhancer, progress_bars[thread_id])] = path
 
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if len(img.shape) == 3 and img.shape[2] == 4:
-            img_mode = 'RGBA'
-        else:
-            img_mode = None
+        for future in as_completed(futures):
+            path = futures[future]
+            save_path, imgname = future.result()
+            if not save_path:
+                print(Fore.RED + f"Failed: {imgname}")
 
-        try:
-            if args.face_enhance:
-                _, _, output = face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
-            else:
-                output, _ = upsampler.enhance(img, outscale=args.outscale)
-        except RuntimeError as error:
-            print('Error', error)
-            print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
-        else:
-            if args.ext == 'auto':
-                extension = extension[1:]
-            else:
-                extension = args.ext
-            if img_mode == 'RGBA':  # RGBA images should be saved in png format
-                extension = 'png'
-            if args.suffix == '':
-                save_path = os.path.join(args.output, f'{imgname}.{extension}')
-            else:
-                save_path = os.path.join(args.output, f'{imgname}_{args.suffix}.{extension}')
-            cv2.imwrite(save_path, output)
-
+    # Закрываем все прогресс-бары
+    for pbar in progress_bars:
+        pbar.close()
 
 if __name__ == '__main__':
     main()
