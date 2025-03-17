@@ -32,7 +32,7 @@ def process_image(path, args, upsampler, face_enhancer=None, progress_bar=None):
     except RuntimeError as error:
         if progress_bar:
             progress_bar.update(1)
-        return None, imgname
+        return None
 
     if args.ext == 'auto':
         extension = extension[1:]
@@ -47,7 +47,7 @@ def process_image(path, args, upsampler, face_enhancer=None, progress_bar=None):
     cv2.imwrite(save_path, output)
     if progress_bar:
         progress_bar.update(1)
-    return save_path, imgname
+    return save_path
 
 
 def process_on_gpu(paths, args, gpu_id, progress_bar):
@@ -122,11 +122,7 @@ def process_on_gpu(paths, args, gpu_id, progress_bar):
 
     # Обработка изображений на текущем GPU
     for path in paths:
-        save_path, imgname = process_image(path, args, upsampler, face_enhancer, progress_bar)
-        if save_path:
-            print(Fore.GREEN + f"GPU {gpu_id}: Saved {save_path}")
-        else:
-            print(Fore.RED + f"GPU {gpu_id}: Failed {imgname}")
+        process_image(path, args, upsampler, face_enhancer, progress_bar)
 
 
 def main():
