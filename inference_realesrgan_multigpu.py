@@ -50,7 +50,7 @@ def process_image(path, args, upsampler, face_enhancer=None, progress_bar=None):
     return save_path, imgname
 
 
-def process_on_gpu(paths, args, gpu_id):
+def process_on_gpu(paths, args, gpu_id, progress_bar):
     """Обрабатывает список изображений на указанном GPU."""
     # Устанавливаем устройство (GPU)
     torch.cuda.set_device(gpu_id)
@@ -122,7 +122,7 @@ def process_on_gpu(paths, args, gpu_id):
 
     # Обработка изображений на текущем GPU
     for path in paths:
-        save_path, imgname = process_image(path, args, upsampler, face_enhancer)
+        save_path, imgname = process_image(path, args, upsampler, face_enhancer, progress_bar)
         if save_path:
             print(Fore.GREEN + f"GPU {gpu_id}: Saved {save_path}")
         else:
@@ -130,7 +130,7 @@ def process_on_gpu(paths, args, gpu_id):
 
 
 def main():
-    """Inference demo for Real-ESRGAN with multi-GPU support."""
+    """Inference demo for Real-ESRGAN with multi-GPU support and progress bars."""
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--input', type=str, default='inputs', help='Input image or folder')
     parser.add_argument(
@@ -192,14 +192,21 @@ def main():
     # Разделение задач между GPU
     paths_per_gpu = [paths[i::num_gpus] for i in range(num_gpus)]
 
+    # Создание прогресс-баров для каждого GPU
+    progress_bars = [tqdm(total=len(paths_per_gpu[i]), desc=f"GPU {i}", unit="image", position=i) for i in range(num_gpus)]
+
     # Запуск обработки на каждом GPU
     with ThreadPoolExecutor(max_workers=num_gpus) as executor:
         futures = []
         for gpu_id, paths in enumerate(paths_per_gpu):
-            futures.append(executor.submit(process_on_gpu, paths, args, gpu_id))
+            futures.append(executor.submit(process_on_gpu, paths, args, gpu_id, progress_bars[gpu_id]))
 
         for future in as_completed(futures):
             future.result()  # Ожидание завершения всех задач
+
+    # Закрытие всех прогресс-баров
+    for pbar in progress_bars:
+        pbar.close()
 
 if __name__ == '__main__':
     main()
