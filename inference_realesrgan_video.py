@@ -11,6 +11,7 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 from os import path as osp
 from tqdm import tqdm
+from multiprocessing import Process, Queue
 
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
@@ -45,17 +46,23 @@ def get_sub_video(args, num_process, process_idx):
     print(f'duration: {duration}, part_time: {part_time}')
     os.makedirs(osp.join(args.output, f'{args.video_name}_inp_tmp_videos'), exist_ok=True)
     out_path = osp.join(args.output, f'{args.video_name}_inp_tmp_videos', f'{process_idx:03d}.mp4')
-    cmd = [
-        args.ffmpeg_bin, f'-i {args.input}', '-ss', f'{part_time * process_idx}',
-        f'-to {part_time * (process_idx + 1)}' if process_idx != num_process - 1 else '', '-async 1', out_path, '-y'
-    ]
-    print(' '.join(cmd))
-    subprocess.call(' '.join(cmd), shell=True)
+
+    # Формируем команду ffmpeg
+    cmd = [args.ffmpeg_bin, '-i', args.input, '-ss', str(part_time * process_idx)]
+
+    # Добавляем -to только если это не последний процесс
+    if process_idx != num_process - 1:
+        cmd.extend(['-to', str(part_time * (process_idx + 1))])
+
+    # Добавляем остальные аргументы
+    cmd.extend(['-async', '1', '-loglevel', 'error', '-y', out_path])
+
+    # Выполняем команду
+    subprocess.call(cmd, shell=False)
     return out_path
 
 
 class Reader:
-
     def __init__(self, args, total_workers=1, worker_idx=0):
         self.args = args
         input_type = mimetypes.guess_type(args.input)[0]
@@ -68,14 +75,13 @@ class Reader:
             self.stream_reader = (
                 ffmpeg.input(video_path).output('pipe:', format='rawvideo', pix_fmt='bgr24',
                                                 loglevel='error').run_async(
-                                                    pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
+                                                    pipe_stdin=True, pipe_stdout=True, pipe_stderr=True, cmd=args.ffmpeg_bin))
             meta = get_video_meta_info(video_path)
             self.width = meta['width']
             self.height = meta['height']
             self.input_fps = meta['fps']
             self.audio = meta['audio']
             self.nb_frames = meta['nb_frames']
-
         else:
             if self.input_type.startswith('image'):
                 self.paths = [args.input]
@@ -135,7 +141,6 @@ class Reader:
 
 
 class Writer:
-
     def __init__(self, args, audio, height, width, video_save_path, fps):
         out_width, out_height = int(width * args.outscale), int(height * args.outscale)
         if out_height > 2160:
@@ -152,14 +157,14 @@ class Writer:
                                  vcodec='libx264',
                                  loglevel='error',
                                  acodec='copy').overwrite_output().run_async(
-                                     pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
+                                     pipe_stdin=True, pipe_stdout=True, pipe_stderr=True, cmd=args.ffmpeg_bin))
         else:
             self.stream_writer = (
                 ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{out_width}x{out_height}',
                              framerate=fps).output(
                                  video_save_path, pix_fmt='yuv420p', vcodec='libx264',
                                  loglevel='error').overwrite_output().run_async(
-                                     pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
+                                     pipe_stdin=True, pipe_stdout=True, pipe_stderr=True, cmd=args.ffmpeg_bin))
 
     def write_frame(self, frame):
         frame = frame.astype(np.uint8).tobytes()
@@ -170,8 +175,8 @@ class Writer:
         self.stream_writer.wait()
 
 
-def inference_video(args, video_save_path, device=None, total_workers=1, worker_idx=0):
-    # ---------------------- determine models according to model names ---------------------- #
+def inference_video(args, video_save_path, device=None, total_workers=1, worker_idx=0, progress_queue=None):
+    # Определяем модель
     args.model_name = args.model_name.split('.pth')[0]
     if args.model_name == 'RealESRGAN_x4plus':  # x4 RRDBNet model
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
@@ -201,23 +206,22 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth'
         ]
 
-    # ---------------------- determine model paths ---------------------- #
+    # Загружаем модель
     model_path = os.path.join('weights', args.model_name + '.pth')
     if not os.path.isfile(model_path):
         ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
         for url in file_url:
-            # model_path will be updated
             model_path = load_file_from_url(
                 url=url, model_dir=os.path.join(ROOT_DIR, 'weights'), progress=True, file_name=None)
 
-    # use dni to control the denoise strength
+    # Используем DNI для управления уровнем шумоподавления
     dni_weight = None
     if args.model_name == 'realesr-general-x4v3' and args.denoise_strength != 1:
         wdn_model_path = model_path.replace('realesr-general-x4v3', 'realesr-general-wdn-x4v3')
         model_path = [model_path, wdn_model_path]
         dni_weight = [args.denoise_strength, 1 - args.denoise_strength]
 
-    # restorer
+    # Инициализируем апсемплер
     upsampler = RealESRGANer(
         scale=netscale,
         model_path=model_path,
@@ -230,29 +234,35 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         device=device,
     )
 
+    # Отключаем улучшение лиц для аниме-моделей
     if 'anime' in args.model_name and args.face_enhance:
         print('face_enhance is not supported in anime models, we turned this option off for you. '
               'if you insist on turning it on, please manually comment the relevant lines of code.')
         args.face_enhance = False
 
-    if args.face_enhance:  # Use GFPGAN for face enhancement
+    # Инициализируем GFPGAN для улучшения лиц
+    if args.face_enhance:
         from gfpgan import GFPGANer
         face_enhancer = GFPGANer(
             model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth',
             upscale=args.outscale,
             arch='clean',
             channel_multiplier=2,
-            bg_upsampler=upsampler)  # TODO support custom device
+            bg_upsampler=upsampler)
     else:
         face_enhancer = None
 
+    # Инициализируем Reader и Writer
     reader = Reader(args, total_workers, worker_idx)
     audio = reader.get_audio()
     height, width = reader.get_resolution()
     fps = reader.get_fps()
     writer = Writer(args, audio, height, width, video_save_path, fps)
 
-    pbar = tqdm(total=len(reader), unit='frame', desc='inference')
+    # Прогресс-бар для текущего процесса
+    pbar = tqdm(total=len(reader), unit='frame', desc=f'Process {worker_idx}', position=worker_idx)
+
+    # Обрабатываем кадры
     while True:
         img = reader.get_frame()
         if img is None:
@@ -269,11 +279,15 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         else:
             writer.write_frame(output)
 
-        torch.cuda.synchronize(device)
+        # Обновляем прогресс-бар
         pbar.update(1)
+        if progress_queue is not None:
+            progress_queue.put(1)
 
+    # Закрываем Reader и Writer
     reader.close()
     writer.close()
+    pbar.close()
 
 
 def run(args):
@@ -283,7 +297,7 @@ def run(args):
     if args.extract_frame_first:
         tmp_frames_folder = osp.join(args.output, f'{args.video_name}_inp_tmp_frames')
         os.makedirs(tmp_frames_folder, exist_ok=True)
-        os.system(f'ffmpeg -i {args.input} -qscale:v 1 -qmin 1 -qmax 1 -vsync 0  {tmp_frames_folder}/frame%08d.png')
+        os.system(f'ffmpeg -i {args.input} -qscale:v 1 -qmin 1 -qmax 1 -vsync 0 -loglevel error {tmp_frames_folder}/frame%08d.png')
         args.input = tmp_frames_folder
 
     num_gpus = torch.cuda.device_count()
@@ -292,30 +306,30 @@ def run(args):
         inference_video(args, video_save_path)
         return
 
-    ctx = torch.multiprocessing.get_context('spawn')
-    pool = ctx.Pool(num_process)
-    os.makedirs(osp.join(args.output, f'{args.video_name}_out_tmp_videos'), exist_ok=True)
-    pbar = tqdm(total=num_process, unit='sub_video', desc='inference')
+    # Очередь для отслеживания прогресса
+    progress_queue = Queue()
+
+    # Запускаем процессы
+    processes = []
     for i in range(num_process):
         sub_video_save_path = osp.join(args.output, f'{args.video_name}_out_tmp_videos', f'{i:03d}.mp4')
-        pool.apply_async(
-            inference_video,
-            args=(args, sub_video_save_path, torch.device(i % num_gpus), num_process, i),
-            callback=lambda arg: pbar.update(1))
-    pool.close()
-    pool.join()
+        p = Process(target=inference_video, args=(args, sub_video_save_path, torch.device(i % num_gpus), num_process, i, progress_queue))
+        p.start()
+        processes.append(p)
 
-    # combine sub videos
-    # prepare vidlist.txt
+    # Ожидаем завершения всех процессов
+    for p in processes:
+        p.join()
+
+    # Объединяем суб-видео
     with open(f'{args.output}/{args.video_name}_vidlist.txt', 'w') as f:
         for i in range(num_process):
             f.write(f'file \'{args.video_name}_out_tmp_videos/{i:03d}.mp4\'\n')
 
     cmd = [
         args.ffmpeg_bin, '-f', 'concat', '-safe', '0', '-i', f'{args.output}/{args.video_name}_vidlist.txt', '-c',
-        'copy', f'{video_save_path}'
+        'copy', '-loglevel', 'error', f'{video_save_path}'
     ]
-    print(' '.join(cmd))
     subprocess.call(cmd)
     shutil.rmtree(osp.join(args.output, f'{args.video_name}_out_tmp_videos'))
     if osp.exists(osp.join(args.output, f'{args.video_name}_inp_tmp_videos')):
@@ -324,10 +338,6 @@ def run(args):
 
 
 def main():
-    """Inference demo for Real-ESRGAN.
-    It mainly for restoring anime videos.
-
-    """
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--input', type=str, default='inputs', help='Input video, image or folder')
     parser.add_argument(
@@ -381,7 +391,7 @@ def main():
 
     if is_video and args.input.endswith('.flv'):
         mp4_path = args.input.replace('.flv', '.mp4')
-        os.system(f'ffmpeg -i {args.input} -codec copy {mp4_path}')
+        os.system(f'ffmpeg -i {args.input} -codec copy -loglevel error {mp4_path}')
         args.input = mp4_path
 
     if args.extract_frame_first and not is_video:
